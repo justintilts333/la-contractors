@@ -1,17 +1,26 @@
-import { NextResponse } from "next/server";
-
-export const dynamic = "force-dynamic";
+// app/api/db-health/route.ts
+import { NextResponse } from 'next/server'
 
 export async function GET() {
-  // Basic health; we’ll wire Supabase later.
-  const env = {
-    hasUrl: !!process.env.NEXT_PUBLIC_SUPABASE_URL,
-    hasAnon: !!process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
-  };
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL
+  const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
 
-  return NextResponse.json({
-    ok: true,
-    env,
-    timestamp: new Date().toISOString()
-  });
+  if (!url || !anon) {
+    return NextResponse.json({ ok: false, error: 'Missing Supabase env vars' }, { status: 500 })
+  }
+
+  try {
+    const r = await fetch(`${url}/rest/v1/inspection_type_map?select=count`, {
+      headers: {
+        apikey: anon,
+        Authorization: `Bearer ${anon}`
+      },
+      cache: 'no-store',
+    })
+    const ok = r.ok
+    const details = ok ? await r.json() : await r.text()
+    return NextResponse.json({ ok, details })
+  } catch (e: any) {
+    return NextResponse.json({ ok: false, error: e?.message || 'fetch error' }, { status: 500 })
+  }
 }
