@@ -1,44 +1,37 @@
-// app/api/ping-supabase/route.ts
-import { NextResponse } from "next/server";
-import { createClient } from "@supabase/supabase-js";
+import { NextResponse } from 'next/server';
+import { createClient } from '@supabase/supabase-js';
 
 export async function GET() {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-
-  if (!url || !anon) {
-    return NextResponse.json(
-      { ok: false, error: "Missing Supabase env vars" },
-      { status: 500 }
-    );
-  }
-
-  const supabase = createClient(url, anon, { auth: { persistSession: false } });
-
   try {
-    // Lightweight “does the DB respond + table exists?” check.
-    const { count, error } = await supabase
-      .from("jurisdictions")
-      .select("jurisdiction_id", { count: "exact", head: true });
-
-    if (error) throw error;
-
-    return NextResponse.json({
-      ok: true,
-      message: "Supabase reachable and jurisdictions table queryable",
-      count,
-    });
-  } catch (e: any) {
-    // Fallback: try a generic ping (no table dependency)
-    try {
-      const { data, error: pingErr } = await supabase.rpc("postgres_version" as any);
-      if (pingErr) throw pingErr;
-      return NextResponse.json({ ok: true, message: "Supabase reachable", version: data });
-    } catch (_err: any) {
+    const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+    const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+    if (!url || !anon) {
       return NextResponse.json(
-        { ok: false, error: String(e?.message || _err?.message || "Unknown error") },
+        { ok: false, error: 'Missing Supabase env vars' },
         { status: 500 }
       );
     }
+
+    // client-side key is fine for a read-only ping; we’re just checking connectivity
+    const supabase = createClient(url, anon);
+
+    // lightweight ping: call RPC if you have one, else do a tiny query
+    // if you created the `inspection_type_map` table earlier, we can count it; otherwise select 1
+    const { data, error } = await supabase
+      .from('inspection_type_map')
+      .select('norm_label', { count: 'exact', head: true });
+
+    if (error) {
+      // fallback tiny query if that table doesn't exist yet
+      const { error: err2 } = await supabase.from('permits').select('permit_number', { head: true, count: 'exact' });
+      if (err2) {
+        return NextResponse.json({ ok: false, error: String(err2.message) }, { status: 500 });
+      }
+      return NextResponse.json({ ok: true, fallback: true });
+    }
+
+    return NextResponse.json({ ok: true, table: 'inspection_type_map', count: data === null ? 0 : null });
+  } catch (e: any) {
+    return NextResponse.json({ ok: false, error: String(e?.message || e) }, { status: 500 });
   }
 }
