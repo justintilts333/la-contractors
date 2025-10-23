@@ -2,7 +2,9 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
-// --- Initialize Supabase ---
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
@@ -13,49 +15,51 @@ const LADBS_URL = "https://data.lacity.org/resource/pi9x-tg5x.json";
 
 export async function GET(req: Request) {
   const url = new URL(req.url);
-  const limit = Number(url.searchParams.get("limit") || 500);
-  const pages = Number(url.searchParams.get("pages") || 2);
+  const limit = Math.min(Number(url.searchParams.get("limit") || 500), 1000);
+  const pages = Math.min(Number(url.searchParams.get("pages") || 2), 200);
   const sinceOverride = url.searchParams.get("since");
   const dryRun = url.searchParams.get("dryRun") === "true";
   const startedAt = new Date().toISOString();
 
   try {
-    // 1️⃣ Read the current watermark
+    // 1) Watermark (safe: maybeSingle)
     const { data: wm, error: wmErr } = await supabase
       .from("etl_watermarks")
       .select("last_issued_date")
       .eq("source_key", "LADBS_PERMITS")
-      .single();
-
+      .maybeSingle();
     if (wmErr) throw wmErr;
 
     const since =
       sinceOverride ||
       (wm?.last_issued_date
-        ? wm.last_issued_date.split("T")[0]
+        ? new Date(wm.last_issued_date).toISOString().slice(0, 10)
         : "2020-01-01");
 
-    console.log("Importing LADBS permits since:", since);
-
-    // 2️⃣ Get Los Angeles jurisdiction_id
+    // 2) Jurisdiction (safe: order+limit+maybeSingle)
     const { data: jRow, error: jErr } = await supabase
       .from("jurisdictions")
-      .select("jurisdiction_id")
+      .select("jurisdiction_id, name")
       .eq("name", "Los Angeles")
-      .single();
+      .order("jurisdiction_id", { ascending: true })
+      .limit(1)
+      .maybeSingle();
     if (jErr) throw jErr;
-    const jid = jRow.jurisdiction_id;
+    if (!jRow?.jurisdiction_id) {
+      throw new Error("Missing jurisdictions row for 'Los Angeles'");
+    }
+    const jid = jRow.jurisdiction_id as number;
 
     let imported = 0;
     let maxIssuedDate: string | null = null;
 
-    // 3️⃣ Page through Socrata API
+    // 3) Page through Socrata API
     for (let page = 0; page < pages; page++) {
       const offset = page * limit;
-      const query = new URLSearchParams({
-        $limit: limit.toString(),
-        $offset: offset.toString(),
-        $order: "issue_date ASC",
+      const params = new URLSearchParams({
+        $limit: String(limit),
+        $offset: String(offset),
+        $order: "issue_date ASC, permit_nbr ASC",
         $where: `issue_date > '${since}'`,
         $select: [
           "permit_nbr",
@@ -77,61 +81,63 @@ export async function GET(req: Request) {
         ].join(","),
       });
 
-      const res = await fetch(`${LADBS_URL}?${query.toString()}`);
+      const res = await fetch(`${LADBS_URL}?${params.toString()}`);
       if (!res.ok) throw new Error(`LADBS API error: ${res.status}`);
-      const rows = await res.json();
+      const rows = (await res.json()) as any[];
 
-      if (rows.length === 0) break;
+      if (!rows?.length) break;
 
-      const upserts = rows.map((r: any) => {
-        const issued = r.issue_date ? new Date(r.issue_date) : null;
-        if (issued && (!maxIssuedDate || issued > new Date(maxIssuedDate))) {
-          maxIssuedDate = issued.toISOString();
-        }
+      const upserts = rows
+        .filter((r) => r.permit_nbr)
+        .map((r) => {
+          const issuedISO: string | null = r.issue_date ?? null;
+          if (issuedISO && (!maxIssuedDate || issuedISO > maxIssuedDate)) {
+            maxIssuedDate = issuedISO;
+          }
 
-        // Simple scope logic
-        const scope = r.permit_type?.toUpperCase().includes("NEW")
-          ? "NEW"
-          : r.permit_type?.toUpperCase().includes("ADDITION")
-          ? "ADDITION"
-          : "ALTERATION";
+          const scope =
+            (r.permit_type || "").toUpperCase().includes("NEW")
+              ? "NEW"
+              : (r.permit_type || "").toUpperCase().includes("ADDITION")
+              ? "ADDITION"
+              : "ALTERATION";
 
-        const isAdu = /ADU/i.test(r.work_desc || "");
-        const aduKind = /JADU/i.test(r.work_desc || "")
-          ? "JADU"
-          : isAdu
-          ? "ADU"
-          : null;
+          const isAdu = /ADU/i.test(r.work_desc || "");
+          const aduKind = /JADU/i.test(r.work_desc || "")
+            ? "JADU"
+            : isAdu
+            ? "ADU"
+            : null;
 
-        return {
-          permit_number: r.permit_nbr,
-          jurisdiction_id: jid,
-          primary_address: r.primary_address || null,
-          address_std: (r.primary_address || "").toUpperCase(),
-          zip_code: r.zip_code,
-          pin_nbr: r.pin_nbr || r.apn,
-          apc: r.apc,
-          cpa: r.cpa,
-          cnc: r.cnc,
-          lat: r.lat,
-          lon: r.lon,
-          permit_scope: scope,
-          is_adu: isAdu,
-          adu_kind: aduKind,
-          work_desc: r.work_desc,
-          issued_date: r.issue_date,
-          sqft: r.square_footage,
-          valuation: r.valuation,
-          valuation_per_sqft:
-            r.valuation && r.square_footage
-              ? Math.round(r.valuation / r.square_footage)
-              : null,
-          source_dataset: "LADBS_API",
-          ingested_at: new Date().toISOString(),
-        };
-      });
+          return {
+            permit_number: r.permit_nbr,
+            jurisdiction_id: jid,
+            primary_address: r.primary_address || null,
+            address_std: (r.primary_address || "").toUpperCase() || null,
+            zip_code: r.zip_code || null,
+            pin_nbr: r.pin_nbr || r.apn || null,
+            apc: r.apc || null,
+            cpa: r.cpa || null,
+            cnc: r.cnc || null,
+            lat: r.lat ?? null,
+            lon: r.lon ?? null,
+            permit_scope: scope,
+            is_adu: isAdu,
+            adu_kind: aduKind,
+            work_desc: r.work_desc || null,
+            issued_date: issuedISO,
+            sqft: r.square_footage ?? null,
+            valuation: r.valuation ?? null,
+            valuation_per_sqft:
+              r.valuation && r.square_footage
+                ? Math.round((r.valuation / Math.max(1, r.square_footage)) * 100) / 100
+                : null,
+            source_dataset: "LADBS_API",
+            ingested_at: new Date().toISOString(),
+          };
+        });
 
-      if (!dryRun) {
+      if (!dryRun && upserts.length) {
         const { error: upErr } = await supabase
           .from("permits")
           .upsert(upserts, { onConflict: "permit_number" });
@@ -139,40 +145,45 @@ export async function GET(req: Request) {
       }
 
       imported += upserts.length;
-      if (rows.length < limit) break; // no more pages
+      if (rows.length < limit) break;
     }
 
-    // 4️⃣ Update watermark if we imported real data
+    // 4) Advance watermark
     if (!dryRun && maxIssuedDate) {
-      const { error: updateErr } = await supabase
+      const { error: wmUpdateErr } = await supabase
         .from("etl_watermarks")
         .update({
           last_issued_date: maxIssuedDate,
           updated_at: new Date().toISOString(),
+          source: "LADBS_PERMITS",
+          source_key: "LADBS_PERMITS",
         })
         .eq("source_key", "LADBS_PERMITS");
-      if (updateErr) throw updateErr;
+      if (wmUpdateErr) throw wmUpdateErr;
     }
 
-    // 5️⃣ Log job run
+    // 5) Job log
     await supabase.from("etl_job_runs").insert({
       source_key: "LADBS_PERMITS",
       job_type: "import",
-      row_count: imported,
       started_at: startedAt,
       ended_at: new Date().toISOString(),
+      row_count: imported,
       status: "SUCCESS",
+      message: `since=${since} dryRun=${dryRun}`,
     });
 
     return NextResponse.json({ imported, since, dryRun });
-  } catch (err: any) {
-    console.error("Import error:", err.message);
+  } catch (e: any) {
     await supabase.from("etl_job_runs").insert({
       source_key: "LADBS_PERMITS",
       job_type: "import",
+      started_at: startedAt,
+      ended_at: new Date().toISOString(),
+      row_count: 0,
       status: "FAILED",
-      message: err.message,
+      message: (e?.message || "").slice(0, 500),
     });
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return NextResponse.json({ error: e?.message || "Unknown error" }, { status: 500 });
   }
 }
