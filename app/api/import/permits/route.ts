@@ -1,6 +1,7 @@
 // app/api/import/permits/route.ts
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
+import { randomUUID } from "crypto";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -162,27 +163,28 @@ export async function GET(req: Request) {
       if (wmUpdateErr) throw wmUpdateErr;
     }
 
-    // 5) Job log
+    // 5) Job log (matches your table: id/uuid, job_name, status, source, rowcount, started_at, finished_at)
     await supabase.from("etl_job_runs").insert({
-      source_key: "LADBS_PERMITS",
-      job_type: "import",
-      started_at: startedAt,
-      ended_at: new Date().toISOString(),
-      row_count: imported,
+      id: randomUUID(),
+      job_name: "import_permits",
       status: "SUCCESS",
-      message: `since=${since} dryRun=${dryRun}`,
+      source: "LADBS_PERMITS",
+      rowcount: imported,
+      started_at: startedAt,
+      finished_at: new Date().toISOString(),
     });
 
     return NextResponse.json({ imported, since, dryRun });
   } catch (e: any) {
+    // Failure log in your schema
     await supabase.from("etl_job_runs").insert({
-      source_key: "LADBS_PERMITS",
-      job_type: "import",
-      started_at: startedAt,
-      ended_at: new Date().toISOString(),
-      row_count: 0,
+      id: randomUUID(),
+      job_name: "import_permits",
       status: "FAILED",
-      message: (e?.message || "").slice(0, 500),
+      source: "LADBS_PERMITS",
+      rowcount: 0,
+      started_at: startedAt,
+      finished_at: new Date().toISOString(),
     });
     return NextResponse.json({ error: e?.message || "Unknown error" }, { status: 500 });
   }
