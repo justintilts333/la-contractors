@@ -11,28 +11,29 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
-// LADBS Inspections dataset (Socrata)
+// LADBS inspections dataset
 const LADBS_INSPECTIONS_URL = "https://data.lacity.org/resource/9w5z-rg2h.json";
 
-// Normalize helper for key stability
+// ---------- helpers ----------
 const norm = (v: any) => (v ?? "").toString().trim().toUpperCase();
+const RESULT_RANK: Record<string, number> = { PASS: 5, PARTIAL: 4, CORRECTION: 3, FAIL: 2, CANCELLED: 1 };
 
-// Result rank used when multiple coincide on same (permit, date, type)
-const RESULT_RANK: Record<string, number> = {
-  PASS: 5, PARTIAL: 4, CORRECTION: 3, FAIL: 2, CANCELLED: 1
-};
-
-// Build a Socrata WHERE for a single permit
-function whereForPermit(permit: string, sinceInspections?: string) {
-  const safe = permit.replace(/'/g, "''");
-  const parts = [`permit = '${safe}'`];
-  if (sinceInspections) parts.push(`inspection_date > '${sinceInspections}T00:00:00'`);
-  return parts.join(" AND ");
+// produce likely LADBS variants from a LA permit id like 22010-10000-03174
+function generatePermitVariants(id: string): string[] {
+  const raw = id.trim();
+  const noDash = raw.replace(/-/g, "");
+  // trim leading zeros in each dash-separated segment, keep at least 1 digit
+  const segTrim = raw
+    .split("-")
+    .map(seg => seg.replace(/^0+/, "") || "0")
+    .join("-");
+  const uniq = new Set<string>([raw, noDash, segTrim]);
+  return Array.from(uniq);
 }
 
-// Build a Socrata WHERE for many permits
-function whereForPermitList(ids: string[], sinceInspections?: string) {
-  const quoted = ids.map((id) => `'${id.replace(/'/g, "''")}'`).join(",");
+function whereForVariants(variants: string[], sinceInspections?: string) {
+  // build: permit in ('A','B',...) [AND inspection_date > ...]
+  const quoted = variants.map(v => `'${v.replace(/'/g, "''")}'`).join(",");
   const parts = [`permit in (${quoted})`];
   if (sinceInspections) parts.push(`inspection_date > '${sinceInspections}T00:00:00'`);
   return parts.join(" AND ");
@@ -51,7 +52,6 @@ async function getJurisdictionId(): Promise<number> {
   return data.jurisdiction_id as number;
 }
 
-// Pull a page of your own permit IDs from Supabase (optionally filter by issued_date)
 async function fetchPermitIds(offset: number, batchSize: number, sinceIssued?: string): Promise<string[]> {
   let q = supabase
     .from("permits")
@@ -64,7 +64,6 @@ async function fetchPermitIds(offset: number, batchSize: number, sinceIssued?: s
   return (data || []).map((r: any) => r.permit_number).filter(Boolean);
 }
 
-// Dedupe a set of rows by (permit, date, type) keeping “best” result
 function dedupeRows(rows: any[]) {
   const seen = new Map<string, { permit: string; dt: string; t: string; result: string }>();
   for (const r of rows) {
@@ -79,26 +78,27 @@ function dedupeRows(rows: any[]) {
       seen.set(key, { permit, dt, t, result });
     } else {
       const currRank = RESULT_RANK[cur.result] ?? 0;
-      const newRank  = RESULT_RANK[result] ?? 0;
+      const newRank = RESULT_RANK[result] ?? 0;
       if (newRank > currRank) seen.set(key, { permit, dt, t, result });
     }
   }
   return Array.from(seen.values());
 }
 
+// ---------- handler ----------
 export async function GET(req: Request) {
   const url = new URL(req.url);
 
   // Controls
   const dryRun            = url.searchParams.get("dryRun") === "true";
-  const sinceInspections  = url.searchParams.get("since") || "2010-01-01"; // widen default to guarantee hits
-  const sinceIssued       = url.searchParams.get("sinceIssued") || null;   // optional: filter which permit IDs to include
+  const sinceInspections  = url.searchParams.get("since") || "2010-01-01";
+  const sinceIssued       = url.searchParams.get("sinceIssued") || null;
   const idBatch           = Math.min(Number(url.searchParams.get("idBatch") || 200), 500);
   const maxPermitPages    = Math.min(Number(url.searchParams.get("permitPages") || 50), 200);
   const perReqLimit       = Math.min(Number(url.searchParams.get("limit") || 1000), 1000);
   const perReqPages       = Math.min(Number(url.searchParams.get("pagesPerIdBatch") || 3), 20);
 
-  // Probe mode (single-permit test)
+  // Probe mode
   const probe             = url.searchParams.get("probe") === "true";
   const probePermit       = url.searchParams.get("permit") || null;
 
@@ -107,12 +107,13 @@ export async function GET(req: Request) {
   try {
     const jid = await getJurisdictionId();
 
-    // ---- PROBE MODE: fetch just one permit's inspections and return a preview ----
+    // ---------- PROBE: try multiple variants for a single permit ----------
     if (probe) {
       if (!probePermit) {
         return NextResponse.json({ error: "probe=true requires ?permit=<PERMIT_NUMBER>" }, { status: 400 });
       }
-      const where = whereForPermit(probePermit, sinceInspections);
+      const variants = generatePermitVariants(probePermit);
+      const where = whereForVariants(variants, sinceInspections);
       const params = new URLSearchParams({
         $limit: String(perReqLimit),
         $offset: "0",
@@ -124,18 +125,19 @@ export async function GET(req: Request) {
       if (!res.ok) throw new Error(`LADBS inspections API error: ${res.status}`);
       const rows = (await res.json()) as any[];
       const deduped = dedupeRows(rows);
-      const preview = deduped.slice(0, 5);
+      const sample = deduped.slice(0, 10);
       return NextResponse.json({
         probe: true,
         permit: probePermit,
+        variants,
         sinceInspections,
         rawCount: rows.length,
         dedupedCount: deduped.length,
-        sample: preview
+        sample
       });
     }
 
-    // ---- NORMAL MODE: iterate over your permit IDs ----
+    // ---------- BULK: iterate across your own permits, query by variant list ----------
     let totalImported = 0;
     let maxInspectionDate: string | null = null;
 
@@ -143,10 +145,18 @@ export async function GET(req: Request) {
       const ids = await fetchPermitIds(permitPage * idBatch, idBatch, sinceIssued || undefined);
       if (!ids.length) break;
 
+      // expand each id to variants, but keep overall IN(...) size reasonable
+      // cap variants per ID at 3 (raw, noDash, segTrim)
+      const expanded: string[] = [];
+      for (const id of ids) {
+        const vars = generatePermitVariants(id);
+        for (const v of vars) expanded.push(v);
+      }
+
+      // Page through Socrata per expanded variant list
       for (let p = 0; p < perReqPages; p++) {
         const offset = p * perReqLimit;
-
-        const where = whereForPermitList(ids, sinceInspections);
+        const where = whereForVariants(expanded, sinceInspections);
         const params = new URLSearchParams({
           $limit: String(perReqLimit),
           $offset: String(offset),
@@ -160,16 +170,15 @@ export async function GET(req: Request) {
         const rows = (await res.json()) as any[];
         if (!rows?.length) break;
 
-        // Deduplicate, then transform
         const deduped = dedupeRows(rows);
         const upserts = deduped.map(v => {
           if (v.dt && (!maxInspectionDate || v.dt > maxInspectionDate)) maxInspectionDate = v.dt;
           return {
-            permit_number: v.permit,
+            permit_number: v.permit,          // NOTE: we store Socrata's 'permit' as-is (variant may differ from our raw)
             jurisdiction_id: jid,
             inspection_date: v.dt,
-            inspection_type_raw: v.t,   // normalized for key stability
-            inspection_type_norm: null, // filled later via SQL normalization
+            inspection_type_raw: v.t,         // normalized for key stability
+            inspection_type_norm: null,       // will be filled via SQL map
             result: v.result || null,
             inspector: null,
             created_at: new Date().toISOString(),
@@ -179,33 +188,27 @@ export async function GET(req: Request) {
         if (!dryRun && upserts.length) {
           const { error: insErr } = await supabase
             .from("inspections")
-            .upsert(upserts, {
-              onConflict: "permit_number,inspection_date,inspection_type_raw",
-            });
+            .upsert(upserts, { onConflict: "permit_number,inspection_date,inspection_type_raw" });
           if (insErr) throw insErr;
         }
 
         totalImported += upserts.length;
-        if (rows.length < perReqLimit) break; // no more pages for this ID batch
+        if (rows.length < perReqLimit) break;
       }
     }
 
-    // Advance inspections watermark
+    // watermark
     if (!dryRun && maxInspectionDate) {
       const { error: wmUpsertErr } = await supabase
         .from("etl_watermarks")
         .upsert(
-          {
-            source: "LADBS_INSPECTIONS",
-            last_inspection_date: maxInspectionDate,
-            last_issued_date: null,
-          },
+          { source: "LADBS_INSPECTIONS", last_inspection_date: maxInspectionDate, last_issued_date: null },
           { onConflict: "source" }
         );
       if (wmUpsertErr) throw wmUpsertErr;
     }
 
-    // Log
+    // log
     await supabase.from("etl_job_runs").insert({
       id: randomUUID(),
       job_name: "import_inspections",
@@ -216,12 +219,7 @@ export async function GET(req: Request) {
       finished_at: new Date().toISOString(),
     });
 
-    return NextResponse.json({
-      imported: totalImported,
-      sinceInspections,
-      sinceIssued,
-      dryRun
-    });
+    return NextResponse.json({ imported: totalImported, sinceInspections, sinceIssued, dryRun });
   } catch (e: any) {
     await supabase.from("etl_job_runs").insert({
       id: randomUUID(),
