@@ -11,9 +11,10 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
+// LADBS inspections dataset
 const LADBS_INSPECTIONS_URL = "https://data.lacity.org/resource/9w5z-rg2h.json";
 
-// Normalize text for stable keys
+// Normalize helper
 function norm(v: any) {
   return (v ?? "").toString().trim().toUpperCase();
 }
@@ -23,6 +24,22 @@ const RESULT_RANK: Record<string, number> = {
   PASS: 5, PARTIAL: 4, CORRECTION: 3, FAIL: 2, CANCELLED: 1
 };
 
+// Fetch existing permits for a list of IDs (chunked to avoid URL length limits)
+async function fetchExistingPermits(permitIds: string[]): Promise<Set<string>> {
+  const exists = new Set<string>();
+  const chunkSize = 500; // safe chunk size for .in()
+  for (let i = 0; i < permitIds.length; i += chunkSize) {
+    const chunk = permitIds.slice(i, i + chunkSize);
+    const { data, error } = await supabase
+      .from("permits")
+      .select("permit_number")
+      .in("permit_number", chunk);
+    if (error) throw error;
+    (data || []).forEach((r: any) => exists.add(r.permit_number));
+  }
+  return exists;
+}
+
 export async function GET(req: Request) {
   const url = new URL(req.url);
   const limit = Math.min(Number(url.searchParams.get("limit") || 500), 1000);
@@ -30,6 +47,10 @@ export async function GET(req: Request) {
   const sinceOverride = url.searchParams.get("since"); // YYYY-MM-DD
   const dryRun = url.searchParams.get("dryRun") === "true";
   const startedAt = new Date().toISOString();
+
+  let totalImported = 0;
+  let totalSkippedNoPermit = 0;
+  let maxInspectionDate: string | null = null;
 
   try {
     // Watermark
@@ -58,23 +79,16 @@ export async function GET(req: Request) {
     if (!jRow?.jurisdiction_id) throw new Error("Missing jurisdiction 'Los Angeles'");
     const jid = jRow.jurisdiction_id as number;
 
-    let imported = 0;
-    let maxInspectionDate: string | null = null;
-
     for (let page = 0; page < pages; page++) {
       const offset = page * limit;
 
+      // Pull a page from Socrata
       const params = new URLSearchParams({
         $limit: String(limit),
         $offset: String(offset),
         $order: "inspection_date ASC, permit ASC",
         $where: `inspection_date > '${since}T00:00:00'`,
-        $select: [
-          "permit",
-          "inspection_date",
-          "inspection",
-          "inspection_result"
-        ].join(","),
+        $select: ["permit", "inspection_date", "inspection", "inspection_result"].join(","),
       });
 
       const res = await fetch(`${LADBS_INSPECTIONS_URL}?${params.toString()}`);
@@ -84,9 +98,11 @@ export async function GET(req: Request) {
 
       // Deduplicate per page by (permit, inspection_date, normalized inspection)
       const seen = new Map<string, { permit: string; dt: string; t: string; result: string }>();
+      const permitsOnPage = new Set<string>();
 
       for (const r of rows) {
         if (!r.permit || !r.inspection_date) continue;
+        permitsOnPage.add(r.permit);
         const dt = r.inspection_date as string;
         if (dt && (!maxInspectionDate || dt > maxInspectionDate)) maxInspectionDate = dt;
 
@@ -104,12 +120,18 @@ export async function GET(req: Request) {
         }
       }
 
-      const upserts = Array.from(seen.values()).map(v => ({
+      // FK safety: only keep those whose permit exists in our DB
+      const existing = await fetchExistingPermits(Array.from(permitsOnPage));
+      const filtered = Array.from(seen.values()).filter(v => existing.has(v.permit));
+      const pageSkipped = seen.size - filtered.length;
+      totalSkippedNoPermit += pageSkipped;
+
+      const upserts = filtered.map(v => ({
         permit_number: v.permit,
         jurisdiction_id: jid,
         inspection_date: v.dt,
         inspection_type_raw: v.t,   // normalized for key stability
-        inspection_type_norm: null, // filled later via SQL map
+        inspection_type_norm: null, // will fill later via SQL map
         result: v.result || null,
         inspector: null
       }));
@@ -123,7 +145,7 @@ export async function GET(req: Request) {
         if (insErr) throw insErr;
       }
 
-      imported += upserts.length;
+      totalImported += upserts.length;
       if (rows.length < limit) break;
     }
 
@@ -148,12 +170,15 @@ export async function GET(req: Request) {
       job_name: "import_inspections",
       status: "SUCCESS",
       source: "LADBS_INSPECTIONS",
-      rowcount: imported,
+      rowcount: totalImported,
       started_at: startedAt,
       finished_at: new Date().toISOString(),
+      // optional: store skipped for your reference
+      // @ts-ignore - depending on your schema
+      message: `skipped_no_permit=${totalSkippedNoPermit}`
     });
 
-    return NextResponse.json({ imported, since, dryRun });
+    return NextResponse.json({ imported: totalImported, skippedNoPermit: totalSkippedNoPermit, since, dryRun });
   } catch (e: any) {
     await supabase.from("etl_job_runs").insert({
       id: randomUUID(),
@@ -161,8 +186,10 @@ export async function GET(req: Request) {
       status: "FAILED",
       source: "LADBS_INSPECTIONS",
       rowcount: 0,
-      started_at: new Date().toISOString(),
+      started_at: startedAt,
       finished_at: new Date().toISOString(),
+      // @ts-ignore
+      message: (e?.message || "").slice(0, 500)
     });
     return NextResponse.json({ error: e?.message || "Unknown error" }, { status: 500 });
   }
