@@ -22,7 +22,7 @@ function socrataUrl(params: Record<string, string>) {
   return `${LADBS_INSPECTIONS_URL}?${usp.toString()}`;
 }
 
-// Generate variants with dashes, spaces, trimmed zeros, etc.
+// Expand a permit id into many queryable forms & fragments (spaces, dashes, no-sep, trimmed zeros, suffix)
 function expandPermitSearchTerms(id: string): string[] {
   const raw = id.trim();
   const segments = raw.includes("-") ? raw.split("-") : raw.split(" ");
@@ -56,16 +56,17 @@ function dedupeRows(rows: any[]) {
   const seen = new Map<string, { permit: string; dt: string; t: string; result: string }>();
   for (const r of rows) {
     if (!r.permit || !r.inspection_date) continue;
-    const permit = r.permit.toString();
-    const dt = r.inspection_date;
-    const t = norm(r.inspection);
-    const result = norm(r.inspection_result);
+    const permit: string = r.permit.toString();
+    const dt: string = r.inspection_date;
+    const t: string = norm(r.inspection);
+    const result: string = norm(r.inspection_result);
     const key = `${permit}|${dt}|${t}`;
     const cur = seen.get(key);
-    if (!cur) seen.set(key, { permit, dt, t, result });
-    else {
+    if (!cur) {
+      seen.set(key, { permit, dt, t, result });
+    } else {
       const currRank = RESULT_RANK[cur.result] ?? 0;
-      const newRank = RESULT_RANK[result] ?? 0;
+      const newRank  = RESULT_RANK[result] ?? 0;
       if (newRank > currRank) seen.set(key, { permit, dt, t, result });
     }
   }
@@ -84,6 +85,7 @@ async function getJurisdictionId(): Promise<number> {
   return data.jurisdiction_id as number;
 }
 
+// One-term multi-strategy fetch
 async function fetchByStrategy(term: string, since: string, limit: number) {
   const select = "permit,inspection_date,inspection,inspection_result";
   const tried: string[] = [];
@@ -103,12 +105,12 @@ async function fetchByStrategy(term: string, since: string, limit: number) {
   rows = await tryUrl({ $limit: String(limit), $offset: "0", $order: "inspection_date ASC", $select: select, $where: where });
   if (rows.length) return { rows, tried };
 
-  // 2) case-insensitive
+  // 2) case-insensitive equality
   where = `upper(permit) = upper('${esc}') AND inspection_date > '${since}T00:00:00'`;
   rows = await tryUrl({ $limit: String(limit), $offset: "0", $order: "inspection_date ASC", $select: select, $where: where });
   if (rows.length) return { rows, tried };
 
-  // 3) LIKE anywhere (handles spaces)
+  // 3) LIKE anywhere (handles spaces/dashes and fragments)
   where = `permit like '%${esc}%' AND inspection_date > '${since}T00:00:00'`;
   rows = await tryUrl({ $limit: String(limit), $offset: "0", $order: "inspection_date ASC", $select: select, $where: where });
   if (rows.length) return { rows, tried };
@@ -122,20 +124,27 @@ async function fetchByStrategy(term: string, since: string, limit: number) {
 
 export async function GET(req: Request) {
   const url = new URL(req.url);
-  const probe = url.searchParams.get("probe") === "true";
-  const probePermit = url.searchParams.get("permit") || null;
-  const since = url.searchParams.get("since") || "2010-01-01";
+  const probe       = url.searchParams.get("probe") === "true";
+  const writeOne    = url.searchParams.get("writeOne") === "true";
+  const bulk        = url.searchParams.get("bulk") === "true";
+  const permitParam = url.searchParams.get("permit") || null;
+  const since       = url.searchParams.get("since") || "2010-01-01";
+
+  // bulk controls
+  const limitPermits   = Math.min(Number(url.searchParams.get("limitPermits") || 500), 2000);
+  const offsetPermits  = Math.max(Number(url.searchParams.get("offsetPermits") || 0), 0);
 
   const startedAt = new Date().toISOString();
 
   try {
     const jid = await getJurisdictionId();
 
+    // ---------- PROBE ----------
     if (probe) {
-      if (!probePermit) {
+      if (!permitParam) {
         return NextResponse.json({ error: "probe=true requires ?permit=<PERMIT_NUMBER>" }, { status: 400 });
       }
-      const terms = expandPermitSearchTerms(probePermit);
+      const terms = expandPermitSearchTerms(permitParam);
       const attempts: Array<{ term: string; tried: string[]; count: number; sample: any[] }> = [];
       let total = 0;
       for (const term of terms) {
@@ -146,7 +155,7 @@ export async function GET(req: Request) {
         if (deduped.length) {
           return NextResponse.json({
             probe: true,
-            permit: probePermit,
+            permit: permitParam,
             terms,
             since,
             totalFound: total,
@@ -154,20 +163,107 @@ export async function GET(req: Request) {
           });
         }
       }
-      return NextResponse.json({ probe: true, permit: probePermit, terms, since, totalFound: 0, attempts });
+      return NextResponse.json({ probe: true, permit: permitParam, terms, since, totalFound: 0, attempts });
     }
 
-    await supabase.from("etl_job_runs").insert({
-      id: randomUUID(),
-      job_name: "import_inspections_probe_only",
-      status: "SUCCESS",
-      source: "LADBS_INSPECTIONS",
-      rowcount: 0,
-      started_at: startedAt,
-      finished_at: new Date().toISOString(),
-    });
+    // ---------- WRITE ONE ----------
+    if (writeOne) {
+      if (!permitParam) {
+        return NextResponse.json({ error: "writeOne=true requires ?permit=<PERMIT_NUMBER>" }, { status: 400 });
+      }
+      const terms = expandPermitSearchTerms(permitParam);
+      let collected: any[] = [];
+      for (const term of terms) {
+        const { rows } = await fetchByStrategy(term, since, 1000);
+        if (rows?.length) {
+          collected = rows;
+          break;
+        }
+      }
+      const deduped = dedupeRows(collected);
+      if (deduped.length) {
+        const upserts = deduped.map(v => ({
+          permit_raw: v.permit,
+          inspection_date: v.dt,
+          inspection: v.t,
+          inspection_result: v.result || null,
+        }));
 
-    return NextResponse.json({ imported: 0, probeOnly: true, since });
+        const { error: upErr } = await supabase.from("inspections_raw").upsert(upserts, {
+          onConflict: "permit_raw,inspection_date,inspection"
+        });
+        if (upErr) throw upErr;
+      }
+
+      await supabase.from("etl_job_runs").insert({
+        id: randomUUID(),
+        job_name: "import_inspections_write_one",
+        status: "SUCCESS",
+        source: "LADBS_INSPECTIONS",
+        rowcount: deduped.length,
+        started_at: startedAt,
+        finished_at: new Date().toISOString(),
+      });
+
+      return NextResponse.json({ wrote: deduped.length, since, permit: permitParam });
+    }
+
+    // ---------- BULK ----------
+    if (bulk) {
+      // pull a window of your permits and build SPACE variant (direct equality tends to work)
+      const { data: keys, error: keyErr } = await supabase
+        .from("permit_keys")
+        .select("permit_space")
+        .order("permit_space", { ascending: true })
+        .range(offsetPermits, offsetPermits + limitPermits - 1);
+      if (keyErr) throw keyErr;
+
+      let totalWrote = 0;
+
+      for (const k of keys || []) {
+        const spaceId = k.permit_space as string;
+        const terms = expandPermitSearchTerms(spaceId); // includes space/dash/no-dash
+        let collected: any[] = [];
+        for (const term of terms) {
+          const { rows } = await fetchByStrategy(term, since, 1000);
+          if (rows?.length) {
+            collected = rows;
+            break;
+          }
+        }
+        if (!collected.length) continue;
+
+        const deduped = dedupeRows(collected);
+        if (deduped.length) {
+          const upserts = deduped.map(v => ({
+            permit_raw: v.permit,
+            inspection_date: v.dt,
+            inspection: v.t,
+            inspection_result: v.result || null,
+          }));
+          const { error: upErr } = await supabase.from("inspections_raw").upsert(upserts, {
+            onConflict: "permit_raw,inspection_date,inspection"
+          });
+          if (upErr) throw upErr;
+          totalWrote += deduped.length;
+        }
+      }
+
+      await supabase.from("etl_job_runs").insert({
+        id: randomUUID(),
+        job_name: "import_inspections_bulk",
+        status: "SUCCESS",
+        source: "LADBS_INSPECTIONS",
+        rowcount: totalWrote,
+        started_at: startedAt,
+        finished_at: new Date().toISOString(),
+      });
+
+      return NextResponse.json({ wrote: totalWrote, since, offsetPermits, limitPermits });
+    }
+
+    // default
+    return NextResponse.json({ ok: true, message: "Use ?probe=, ?writeOne=, or ?bulk=" });
   } catch (e: any) {
     await supabase.from("etl_job_runs").insert({
       id: randomUUID(),
@@ -177,6 +273,7 @@ export async function GET(req: Request) {
       rowcount: 0,
       started_at: new Date().toISOString(),
       finished_at: new Date().toISOString(),
+      // @ts-ignore
       message: (e?.message || "").slice(0, 500),
     });
     return NextResponse.json({ error: e?.message || "Unknown error" }, { status: 500 });
