@@ -17,21 +17,59 @@ const LADBS_INSPECTIONS_URL = "https://data.lacity.org/resource/9w5z-rg2h.json";
 const norm = (v: any) => (v ?? "").toString().trim().toUpperCase();
 const RESULT_RANK: Record<string, number> = { PASS: 5, PARTIAL: 4, CORRECTION: 3, FAIL: 2, CANCELLED: 1 };
 
-// produce likely LADBS variants from a LA permit id like 21016-10000-52943
-function generatePermitVariants(id: string): string[] {
-  const raw = id.trim();
-  const noDash = raw.replace(/-/g, "");
-  const segTrim = raw
-    .split("-")
-    .map(seg => seg.replace(/^0+/, "") || "0")
-    .join("-");
-  const uniq = new Set<string>([raw, noDash, segTrim]);
-  return Array.from(uniq);
-}
-
 function socrataUrl(params: Record<string, string>) {
   const usp = new URLSearchParams(params);
   return `${LADBS_INSPECTIONS_URL}?${usp.toString()}`;
+}
+
+// Generate variants with dashes, spaces, trimmed zeros, etc.
+function expandPermitSearchTerms(id: string): string[] {
+  const raw = id.trim();
+  const segments = raw.includes("-") ? raw.split("-") : raw.split(" ");
+  const [seg1 = "", seg2 = "", seg3 = ""] = segments.map(s => s.trim());
+
+  const withDashes = [seg1, seg2, seg3].join("-");
+  const withSpaces = [seg1, seg2, seg3].join(" ");
+  const noDashes   = withDashes.replace(/-/g, "");
+  const noSpaces   = withSpaces.replace(/\s+/g, "");
+  const segTrim = [seg1, seg2, seg3].map(s => s.replace(/^0+/, "") || "0");
+  const trimDashes = segTrim.join("-");
+  const trimSpaces = segTrim.join(" ");
+
+  const suffix5 = seg3.slice(-5);
+  const suffix6 = seg3.slice(-6);
+  const midDash = `${seg2}-${seg3}`.trim();
+  const midSpace = `${seg2} ${seg3}`.trim();
+  const midNoSep = `${seg2}${seg3}`.trim();
+
+  return Array.from(new Set([
+    raw,
+    withDashes, withSpaces,
+    noDashes, noSpaces,
+    trimDashes, trimSpaces,
+    seg3, suffix5, suffix6,
+    midDash, midSpace, midNoSep
+  ].filter(Boolean)));
+}
+
+function dedupeRows(rows: any[]) {
+  const seen = new Map<string, { permit: string; dt: string; t: string; result: string }>();
+  for (const r of rows) {
+    if (!r.permit || !r.inspection_date) continue;
+    const permit = r.permit.toString();
+    const dt = r.inspection_date;
+    const t = norm(r.inspection);
+    const result = norm(r.inspection_result);
+    const key = `${permit}|${dt}|${t}`;
+    const cur = seen.get(key);
+    if (!cur) seen.set(key, { permit, dt, t, result });
+    else {
+      const currRank = RESULT_RANK[cur.result] ?? 0;
+      const newRank = RESULT_RANK[result] ?? 0;
+      if (newRank > currRank) seen.set(key, { permit, dt, t, result });
+    }
+  }
+  return Array.from(seen.values());
 }
 
 async function getJurisdictionId(): Promise<number> {
@@ -39,7 +77,6 @@ async function getJurisdictionId(): Promise<number> {
     .from("jurisdictions")
     .select("jurisdiction_id")
     .eq("name", "Los Angeles")
-    .order("jurisdiction_id", { ascending: true })
     .limit(1)
     .maybeSingle();
   if (error) throw error;
@@ -47,211 +84,90 @@ async function getJurisdictionId(): Promise<number> {
   return data.jurisdiction_id as number;
 }
 
-async function fetchPermitIds(offset: number, batchSize: number, sinceIssued?: string): Promise<string[]> {
-  let q = supabase
-    .from("permits")
-    .select("permit_number", { count: "exact" })
-    .order("permit_number", { ascending: true })
-    .range(offset, offset + batchSize - 1);
-  if (sinceIssued) q = q.gte("issued_date", `${sinceIssued}T00:00:00`);
-  const { data, error } = await q;
-  if (error) throw error;
-  return (data || []).map((r: any) => r.permit_number).filter(Boolean);
-}
-
-function dedupeRows(rows: any[]) {
-  const seen = new Map<string, { permit: string; dt: string; t: string; result: string }>();
-  for (const r of rows) {
-    if (!r.permit || !r.inspection_date) continue;
-    const permit: string = r.permit.toString();
-    const dt: string = r.inspection_date;
-    const t: string = norm(r.inspection);
-    const result: string = norm(r.inspection_result);
-    const key = `${permit}|${dt}|${t}`;
-    const cur = seen.get(key);
-    if (!cur) {
-      seen.set(key, { permit, dt, t, result });
-    } else {
-      const currRank = RESULT_RANK[cur.result] ?? 0;
-      const newRank  = RESULT_RANK[result] ?? 0;
-      if (newRank > currRank) seen.set(key, { permit, dt, t, result });
-    }
-  }
-  return Array.from(seen.values());
-}
-
-// One-variant fetch using different SoQL strategies
-async function fetchByVariant(variant: string, sinceInspections: string, limit: number) {
+async function fetchByStrategy(term: string, since: string, limit: number) {
+  const select = "permit,inspection_date,inspection,inspection_result";
   const tried: string[] = [];
-  const select = ["permit", "inspection_date", "inspection", "inspection_result"].join(",");
-
-  // Strategy 1: exact equality on permit
-  {
-    const where = `permit = '${variant.replace(/'/g, "''")}' AND inspection_date > '${sinceInspections}T00:00:00'`;
-    const url = socrataUrl({ $limit: String(limit), $offset: "0", $order: "inspection_date ASC, permit ASC", $select: select, $where: where });
+  async function tryUrl(params: Record<string,string>) {
+    const url = socrataUrl(params);
     tried.push(url);
-    const r = await fetch(url);
-    if (r.ok) {
-      const rows = (await r.json()) as any[];
-      if (rows?.length) return { rows, tried };
-    }
+    const res = await fetch(url);
+    if (!res.ok) return [];
+    return (await res.json()) as any[];
   }
 
-  // Strategy 2: case-insensitive equality using upper()
-  {
-    const where = `upper(permit) = upper('${variant.replace(/'/g, "''")}') AND inspection_date > '${sinceInspections}T00:00:00'`;
-    const url = socrataUrl({ $limit: String(limit), $offset: "0", $order: "inspection_date ASC, permit ASC", $select: select, $where: where });
-    tried.push(url);
-    const r = await fetch(url);
-    if (r.ok) {
-      const rows = (await r.json()) as any[];
-      if (rows?.length) return { rows, tried };
-    }
-  }
+  const esc = term.replace(/'/g,"''");
+  let rows: any[] = [];
 
-  // Strategy 3: full-text fallback $q (Socrata search)
-  {
-    const url = socrataUrl({ $limit: String(limit), $offset: "0", $order: "inspection_date ASC, permit ASC", $select: select, $q: variant });
-    tried.push(url);
-    const r = await fetch(url);
-    if (r.ok) {
-      const rows = (await r.json()) as any[];
-      if (rows?.length) return { rows, tried };
-    }
-  }
+  // 1) exact equality
+  let where = `permit = '${esc}' AND inspection_date > '${since}T00:00:00'`;
+  rows = await tryUrl({ $limit: String(limit), $offset: "0", $order: "inspection_date ASC", $select: select, $where: where });
+  if (rows.length) return { rows, tried };
 
-  return { rows: [] as any[], tried };
+  // 2) case-insensitive
+  where = `upper(permit) = upper('${esc}') AND inspection_date > '${since}T00:00:00'`;
+  rows = await tryUrl({ $limit: String(limit), $offset: "0", $order: "inspection_date ASC", $select: select, $where: where });
+  if (rows.length) return { rows, tried };
+
+  // 3) LIKE anywhere (handles spaces)
+  where = `permit like '%${esc}%' AND inspection_date > '${since}T00:00:00'`;
+  rows = await tryUrl({ $limit: String(limit), $offset: "0", $order: "inspection_date ASC", $select: select, $where: where });
+  if (rows.length) return { rows, tried };
+
+  // 4) full-text fallback
+  rows = await tryUrl({ $limit: String(limit), $offset: "0", $order: "inspection_date ASC", $select: select, $q: term });
+  if (rows.length) return { rows, tried };
+
+  return { rows: [], tried };
 }
 
 export async function GET(req: Request) {
   const url = new URL(req.url);
-
-  const dryRun            = url.searchParams.get("dryRun") === "true";
-  const sinceInspections  = url.searchParams.get("since") || "2010-01-01";
-  const sinceIssued       = url.searchParams.get("sinceIssued") || null;
-
-  const idBatch           = Math.min(Number(url.searchParams.get("idBatch") || 200), 500);
-  const maxPermitPages    = Math.min(Number(url.searchParams.get("permitPages") || 50), 200);
-  const perReqLimit       = Math.min(Number(url.searchParams.get("limit") || 1000), 1000);
-  const perReqPages       = Math.min(Number(url.searchParams.get("pagesPerIdBatch") || 2), 20);
-
-  const probe             = url.searchParams.get("probe") === "true";
-  const probePermit       = url.searchParams.get("permit") || null;
+  const probe = url.searchParams.get("probe") === "true";
+  const probePermit = url.searchParams.get("permit") || null;
+  const since = url.searchParams.get("since") || "2010-01-01";
 
   const startedAt = new Date().toISOString();
 
   try {
     const jid = await getJurisdictionId();
 
-    // ---------- PROBE: show exactly what we queried ----------
     if (probe) {
       if (!probePermit) {
         return NextResponse.json({ error: "probe=true requires ?permit=<PERMIT_NUMBER>" }, { status: 400 });
       }
-      const variants = generatePermitVariants(probePermit);
-      let rawCount = 0;
-      const attempts: Array<{ variant: string; tried: string[]; count: number; sample: any[] }> = [];
-
-      for (const v of variants) {
-        const { rows, tried } = await fetchByVariant(v, sinceInspections, perReqLimit);
+      const terms = expandPermitSearchTerms(probePermit);
+      const attempts: Array<{ term: string; tried: string[]; count: number; sample: any[] }> = [];
+      let total = 0;
+      for (const term of terms) {
+        const { rows, tried } = await fetchByStrategy(term, since, 1000);
         const deduped = dedupeRows(rows);
-        attempts.push({ variant: v, tried, count: deduped.length, sample: deduped.slice(0, 5) });
-        rawCount += deduped.length;
+        attempts.push({ term, tried, count: deduped.length, sample: deduped.slice(0, 10) });
+        total += deduped.length;
         if (deduped.length) {
-          // short-circuit once any variant returns hits
           return NextResponse.json({
             probe: true,
             permit: probePermit,
-            variants,
-            sinceInspections,
-            totalFound: rawCount,
+            terms,
+            since,
+            totalFound: total,
             attempts
           });
         }
       }
-
-      // none matched
-      return NextResponse.json({
-        probe: true,
-        permit: probePermit,
-        variants,
-        sinceInspections,
-        totalFound: 0,
-        attempts
-      });
+      return NextResponse.json({ probe: true, permit: probePermit, terms, since, totalFound: 0, attempts });
     }
 
-    // ---------- BULK: iterate across your own permits, try variants & strategies ----------
-    let totalImported = 0;
-
-    for (let permitPage = 0; permitPage < maxPermitPages; permitPage++) {
-      const ids = await fetchPermitIds(permitPage * idBatch, idBatch, sinceIssued || undefined);
-      if (!ids.length) break;
-
-      // Build a combined result set for this page
-      let pageRows: any[] = [];
-
-      for (const id of ids) {
-        const variants = generatePermitVariants(id);
-        let found = false;
-
-        for (const v of variants) {
-          const { rows } = await fetchByVariant(v, sinceInspections, perReqLimit);
-          if (rows?.length) {
-            pageRows = pageRows.concat(rows);
-            found = true;
-            break; // stop at first successful variant for this id
-          }
-        }
-
-        // optional: we could continue to next id even if not found (expected for some)
-      }
-
-      if (!pageRows.length) continue;
-
-      // Dedupe and transform
-      const deduped = dedupeRows(pageRows);
-      const upserts = deduped.map(v => ({
-        permit_number: v.permit,          // store exactly as returned
-        jurisdiction_id: jid,
-        inspection_date: v.dt,
-        inspection_type_raw: v.t,
-        inspection_type_norm: null,
-        result: v.result || null,
-        inspector: null,
-        created_at: new Date().toISOString(),
-      }));
-
-      if (!dryRun && upserts.length) {
-        const { error: insErr } = await supabase
-          .from("inspections")
-          .upsert(upserts, { onConflict: "permit_number,inspection_date,inspection_type_raw" });
-        if (insErr) throw insErr;
-      }
-
-      totalImported += upserts.length;
-
-      // We don't paginate within each ID now (perReqPages) because we’re iterating IDs.
-      // If needed later, we can add deeper paging, but this approach maximizes match quality first.
-    }
-
-    // Log success
     await supabase.from("etl_job_runs").insert({
       id: randomUUID(),
-      job_name: "import_inspections",
+      job_name: "import_inspections_probe_only",
       status: "SUCCESS",
       source: "LADBS_INSPECTIONS",
-      rowcount: totalImported,
+      rowcount: 0,
       started_at: startedAt,
       finished_at: new Date().toISOString(),
     });
 
-    return NextResponse.json({
-      imported: totalImported,
-      sinceInspections,
-      sinceIssued,
-      dryRun
-    });
+    return NextResponse.json({ imported: 0, probeOnly: true, since });
   } catch (e: any) {
     await supabase.from("etl_job_runs").insert({
       id: randomUUID(),
@@ -261,7 +177,6 @@ export async function GET(req: Request) {
       rowcount: 0,
       started_at: new Date().toISOString(),
       finished_at: new Date().toISOString(),
-      // @ts-ignore
       message: (e?.message || "").slice(0, 500),
     });
     return NextResponse.json({ error: e?.message || "Unknown error" }, { status: 500 });
