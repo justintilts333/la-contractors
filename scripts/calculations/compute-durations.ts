@@ -1,5 +1,4 @@
 import { createClient } from '@supabase/supabase-js';
-import { calculateDuration } from '../utils/date-helpers';
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -14,7 +13,7 @@ interface Inspection {
   inspection_result: string;
 }
 
-// ✅ NEW: Helper function to check if inspection result indicates approval
+// Helper to check if inspection result indicates approval
 function isApproved(result: string): boolean {
   const passingResults = [
     'APPROVED',
@@ -30,6 +29,18 @@ function isApproved(result: string): boolean {
     'APPROVED PENDING GREENAPPROVAL'
   ];
   return passingResults.includes(result);
+}
+
+// Helper to calculate days between two dates
+function calculateDuration(startDate?: string, endDate?: string): number | null {
+  if (!startDate || !endDate) return null;
+  
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  const diffTime = Math.abs(end.getTime() - start.getTime());
+  const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+  
+  return diffDays;
 }
 
 export async function computeDurations() {
@@ -87,7 +98,7 @@ export async function computeDurations() {
       continue;
     }
     
-    // Find key milestones - ✅ UPDATED: Now uses isApproved() helper
+    // Find key milestones
     const firstPassed = inspections.find((i: Inspection) => 
       isApproved(i.inspection_result)
     );
