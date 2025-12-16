@@ -1,8 +1,16 @@
 {
-    "crons": [
-      {
-        "path": "/api/cron/calculations",
-        "schedule": "0 4 * * *"
-      }
-    ]
-  }
+  "crons": [
+    {
+      "path": "/api/cron/calculations",
+      "schedule": "0 4 * * *"
+    },
+    {
+      "path": "/api/cron/compute-durations",
+      "schedule": "0 5 * * *"
+    },
+    {
+      "path": "/api/cron/compute-contractor-metrics",
+      "schedule": "0 6 * * *"
+    }
+  ]
+}
