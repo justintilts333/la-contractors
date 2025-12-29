@@ -20,6 +20,7 @@ interface Contractor {
   builds_in_last_year: number;
   avg_time_to_completion_days: number;
   avg_failed_inspections: number;
+  completion_rate: number;
   google_rating: number;
   google_review_count: number;
   yelp_rating: number;
@@ -300,9 +301,7 @@ export default function ContractorDetailPage() {
 
   const totalProjects = builds.length;
   const completedBuilds = builds.filter(b => b.finaled_date).length;
-  const completionRate = totalProjects > 0 
-    ? Math.round((completedBuilds / totalProjects) * 100)
-    : 0;
+  const completionRate = contractor.completion_rate ?? 0;
 
   const avgReviewRating = contractor.google_rating && contractor.yelp_rating
     ? ((contractor.google_rating + contractor.yelp_rating) / 2).toFixed(1)

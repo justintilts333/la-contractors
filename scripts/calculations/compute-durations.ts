@@ -13,7 +13,6 @@ interface Inspection {
   inspection_result: string;
 }
 
-// Helper to check if inspection result indicates approval
 function isApproved(result: string): boolean {
   const passingResults = [
     'APPROVED',
@@ -31,7 +30,6 @@ function isApproved(result: string): boolean {
   return passingResults.includes(result);
 }
 
-// Helper to calculate days between two dates
 function calculateDuration(startDate?: string, endDate?: string): number | null {
   if (!startDate || !endDate) return null;
   
@@ -46,14 +44,12 @@ function calculateDuration(startDate?: string, endDate?: string): number | null 
 export async function computeDurations() {
   console.log('Starting duration calculations...');
   
-  // Get total count first
   const { count } = await supabase
     .from('permits')
     .select('*', { count: 'exact', head: true });
   
   console.log(`Total permits in database: ${count}`);
   
-  // Fetch all permits in batches (Supabase defaults to 1000 row limit)
   let allPermits: any[] = [];
   let from = 0;
   const batchSize = 1000;
@@ -80,7 +76,6 @@ export async function computeDurations() {
   let updated = 0;
   
   for (const permit of allPermits) {
-    // Fetch all inspections for this permit
     const { data: inspections, error: inspError } = await supabase
       .from('inspections')
       .select('*')
@@ -93,12 +88,10 @@ export async function computeDurations() {
     }
     
     if (!inspections || inspections.length === 0) {
-      // No inspections, skip this permit
       processed++;
       continue;
     }
     
-    // Find key milestones
     const firstPassed = inspections.find((i: Inspection) => 
       isApproved(i.inspection_result)
     );
@@ -118,7 +111,6 @@ export async function computeDurations() {
       i.inspection_type === 'FINAL' && isApproved(i.inspection_result)
     );
     
-    // Calculate durations
     const durations = {
       permit_number: permit.permit_nbr,
       start_to_foundation: calculateDuration(
@@ -147,7 +139,6 @@ export async function computeDurations() {
       )
     };
     
-    // UPSERT into inspection_phase_metrics
     const { error: upsertError } = await supabase
       .from('inspection_phase_metrics')
       .upsert(durations, { onConflict: 'permit_number' });
@@ -157,7 +148,6 @@ export async function computeDurations() {
       continue;
     }
     
-    // Update permits table with derived fields
     if (firstPassed) {
       const pullToStartLag = calculateDuration(
         permit.issue_date,
@@ -177,7 +167,6 @@ export async function computeDurations() {
     updated++;
     processed++;
     
-    // Progress logging every 100 permits
     if (processed % 100 === 0) {
       console.log(`Processed ${processed}/${allPermits.length} permits...`);
     }
@@ -188,12 +177,9 @@ export async function computeDurations() {
   return { processed, updated };
 }
 
-// Allow direct execution for testing
-if (require.main === module) {
-  computeDurations()
-    .then(() => process.exit(0))
-    .catch((error) => {
-      console.error('Fatal error:', error);
-      process.exit(1);
-    });
-}
+computeDurations()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error('Fatal error:', error);
+    process.exit(1);
+  });

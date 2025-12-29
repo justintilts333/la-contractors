@@ -8,142 +8,153 @@ const supabase = createClient(
 export async function computeContractorMetrics() {
   console.log('Starting contractor metrics calculations...');
   
-  // Get all contractors
-  const { data: contractors, error: contractorsError } = await supabase
+  const { count } = await supabase
     .from('contractors')
-    .select('contractor_id');
+    .select('*', { count: 'exact', head: true });
   
-  if (contractorsError) {
-    console.error('Error fetching contractors:', contractorsError);
-    throw contractorsError;
+  console.log(`Total contractors in database: ${count}`);
+  
+  let allContractors: any[] = [];
+  let from = 0;
+  const batchSize = 1000;
+  
+  while (from < (count || 0)) {
+    const { data, error } = await supabase
+      .from('contractors')
+      .select('contractor_id')
+      .range(from, from + batchSize - 1);
+    
+    if (error) {
+      console.error('Error fetching contractors:', error);
+      throw error;
+    }
+    
+    allContractors = allContractors.concat(data || []);
+    from += batchSize;
+    console.log(`Loaded ${allContractors.length}/${count} contractors...`);
   }
   
-  console.log(`Processing ${contractors.length} contractors...`);
+  console.log(`Processing ${allContractors.length} contractors...`);
   
   let processed = 0;
   let updated = 0;
+  let skippedNoLinks = 0;
+  let skippedNoBuilds = 0;
   
-  for (const contractor of contractors) {
-    // Get all permits for this contractor
-    const { data: permits, error: permitsError } = await supabase
-      .from('permits')
-      .select(`
-        permit_id,
-        permit_nbr,
-        issue_date,
-        finaled_date,
-        started_date,
-        started_but_not_completed,
-        pull_to_start_lag_days
-      `)
+  for (const contractor of allContractors) {
+    const { data: buildLinks, error: linksError } = await supabase
+      .from('build_contractors')
+      .select('build_id')
       .eq('contractor_id', contractor.contractor_id);
     
-    if (permitsError || !permits || permits.length === 0) {
+    if (linksError) {
+      console.error('Error fetching build links for contractor:', contractor.contractor_id, linksError);
       processed++;
       continue;
     }
     
-    // Get metrics for these permits
-    const permitNumbers = permits.map(p => p.permit_nbr);
-    const { data: metrics } = await supabase
-      .from('inspection_phase_metrics')
+    if (!buildLinks || buildLinks.length === 0) {
+      skippedNoLinks++;
+      processed++;
+      continue;
+    }
+    
+    const buildIds = buildLinks.map(bl => bl.build_id);
+    
+    const { data: builds, error: buildsError } = await supabase
+      .from('builds')
       .select('*')
-      .in('permit_number', permitNumbers);
+      .in('build_id', buildIds);
     
-    // Get inspections for failure count
-    const permitIds = permits.map(p => p.permit_id);
-    const { data: inspections } = await supabase
-      .from('inspections')
-      .select('permit_id, inspection_result')
-      .in('permit_id', permitIds);
+    if (buildsError) {
+      console.error('Error fetching builds for contractor:', contractor.contractor_id, buildsError);
+      processed++;
+      continue;
+    }
     
-    // Calculate metrics
-    const totalPermits = permits.length;
-    const completedPermits = permits.filter(p => p.finaled_date).length;
-    const activePermits = permits.filter(p => 
-      p.started_date && !p.finaled_date
-    ).length;
+    if (!builds || builds.length === 0) {
+      skippedNoBuilds++;
+      processed++;
+      continue;
+    }
     
-    // Last year builds
-    const oneYearAgo = new Date();
-    oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
-    const buildsLastYear = permits.filter(p => 
-      new Date(p.issue_date) >= oneYearAgo
-    ).length;
+    const totalBuilds = builds.length;
+    const startedBuilds = builds.filter(b => b.started_date).length;
+    const completedBuilds = builds.filter(b => b.finaled_date).length;
+    const activeBuilds = builds.filter(b => b.started_date && !b.finaled_date).length;
     
-    // Average time to completion (only completed projects)
-    const completionTimes = (metrics || [])
-      .filter(m => m.start_to_final !== null)
-      .map(m => m.start_to_final);
-    const avgCompletion = completionTimes.length > 0
-      ? Math.round(completionTimes.reduce((a, b) => a + b, 0) / completionTimes.length)
+    const completionRate = startedBuilds > 0 
+      ? Math.round((completedBuilds / startedBuilds) * 100)
       : null;
     
-    // Average time to pass final
-    const finalTimes = (metrics || [])
-      .filter(m => m.time_to_pass_final !== null)
-      .map(m => m.time_to_pass_final);
+    const oneYearAgo = new Date();
+    oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+    const buildsLastYear = builds.filter(b => {
+      if (!b.created_at) return false;
+      return new Date(b.created_at) >= oneYearAgo;
+    }).length;
+    
+    const startToFinalTimes = builds
+      .map(b => b.start_to_final_days)
+      .filter(t => t !== null && t > 0);
+    const avgStartToFinal = startToFinalTimes.length > 0
+      ? Math.round(startToFinalTimes.reduce((a, b) => a + b, 0) / startToFinalTimes.length)
+      : null;
+    
+    const finalTimes = builds
+      .map(b => b.time_to_pass_final_days)
+      .filter(t => t !== null && t > 0);
     const avgFinalTime = finalTimes.length > 0
       ? Math.round(finalTimes.reduce((a, b) => a + b, 0) / finalTimes.length)
       : null;
     
-    // Average failed inspections per permit
-    const failuresByPermit = permitIds.map(permitId => {
-      const permitInspections = (inspections || []).filter(i => i.permit_id === permitId);
-      return permitInspections.filter(i => 
-        i.inspection_result === 'CORRECTIONS ISSUED' || 
-        i.inspection_result === 'NOT READY FOR INSPECTION'
-      ).length;
-    });
-    const avgFailures = failuresByPermit.length > 0
-      ? Math.round((failuresByPermit.reduce((a, b) => a + b, 0) / failuresByPermit.length) * 10) / 10
+    const failures = builds.map(b => b.total_failures || 0);
+    const avgFailures = failures.length > 0
+      ? Math.round((failures.reduce((a, b) => a + b, 0) / failures.length) * 10) / 10
       : null;
     
-    // Find last active date
-    const allDates = permits
-      .map(p => p.issue_date)
+    const dates = builds
+      .map(b => b.created_at)
       .filter(d => d)
       .map(d => new Date(d))
       .sort((a, b) => b.getTime() - a.getTime());
-    const lastActive = allDates.length > 0 ? allDates[0].toISOString().split('T')[0] : null;
+    const lastActive = dates.length > 0 ? dates[0].toISOString().split('T')[0] : null;
     
-    // Update contractor
     const { error: updateError } = await supabase
       .from('contractors')
       .update({
-        active_builds: activePermits,
+        active_builds: activeBuilds,
         builds_in_last_year: buildsLastYear,
-        avg_time_to_completion_days: avgCompletion,
+        avg_time_to_completion_days: avgStartToFinal,
         avg_time_to_pass_final_days: avgFinalTime,
         avg_failed_inspections: avgFailures,
+        completion_rate: completionRate,
         last_active_date: lastActive
       })
       .eq('contractor_id', contractor.contractor_id);
     
     if (updateError) {
-      console.error(`Error updating contractor ${contractor.contractor_id}:`, updateError);
+      console.error('Error updating contractor:', contractor.contractor_id, updateError);
       continue;
     }
     
     updated++;
     processed++;
     
-    if (processed % 10 === 0) {
-      console.log(`Processed ${processed}/${contractors.length} contractors...`);
+    if (processed % 100 === 0) {
+      console.log(`Processed ${processed}/${allContractors.length} contractors... (Updated: ${updated}, Skipped no links: ${skippedNoLinks}, Skipped no builds: ${skippedNoBuilds})`);
     }
   }
   
   console.log(`✅ Completed! Processed: ${processed}, Updated: ${updated}`);
+  console.log(`Skipped (no build links): ${skippedNoLinks}, Skipped (no builds): ${skippedNoBuilds}`);
   
   return { processed, updated };
 }
 
-// Allow direct execution
-if (require.main === module) {
-  computeContractorMetrics()
-    .then(() => process.exit(0))
-    .catch((error) => {
-      console.error('Fatal error:', error);
-      process.exit(1);
-    });
-}
+computeContractorMetrics()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error('Fatal error:', error);
+    process.exit(1);
+  });
