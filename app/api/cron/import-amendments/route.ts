@@ -18,7 +18,7 @@ export async function GET(request: NextRequest) {
   try {
     const url = new URL(request.url);
     const offset = parseInt(url.searchParams.get('offset') || '0');
-    const limit = 100;
+    const limit = 10; // REDUCED from 100 to avoid URI too long error
     
     const { data: permits, error } = await supabase
       .from('permits')
