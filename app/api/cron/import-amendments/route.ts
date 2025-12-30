@@ -9,20 +9,16 @@ const supabase = createClient(
 export const maxDuration = 300; // 5 minutes
 
 export async function GET(request: NextRequest) {
-  // Temporarily disabled for initial import
-  // const authHeader = request.headers.get('authorization');
-  // if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
-  //   return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  // }
-
   try {
     const url = new URL(request.url);
     const offset = parseInt(url.searchParams.get('offset') || '0');
-    const limit = 10; // REDUCED from 100 to avoid URI too long error
+    const limit = 10; // Process 10 base permits at a time
     
+    // Get BASE permits only (digit 0)
     const { data: permits, error } = await supabase
       .from('permits')
       .select('permit_id, permit_nbr')
+      .eq(supabase.raw('SUBSTRING(permit_nbr FROM 11 FOR 1)'), '0')
       .range(offset, offset + limit - 1);
     
     if (error) throw error;
@@ -35,13 +31,15 @@ export async function GET(request: NextRequest) {
     let totalInserted = 0;
     let contractorChanges = 0;
     
+    // Build amendment patterns (digits 1-9)
     const allPatterns: string[] = [];
     const permitMap = new Map<string, { permit_id: number, base_nbr: string }>();
     
     for (const permit of permits) {
       const baseNumber = permit.permit_nbr;
       for (let amendNum = 1; amendNum <= 9; amendNum++) {
-        const amendmentNumber = baseNumber.substring(0, 9) + amendNum + baseNumber.substring(10);
+        // Replace 10th character (index 10) with amendment digit
+        const amendmentNumber = baseNumber.substring(0, 10) + amendNum + baseNumber.substring(11);
         allPatterns.push(amendmentNumber);
         permitMap.set(amendmentNumber, { permit_id: permit.permit_id, base_nbr: baseNumber });
       }
@@ -61,7 +59,7 @@ export async function GET(request: NextRequest) {
       const permitInfo = permitMap.get(amendment.permit_nbr);
       if (!permitInfo) continue;
       
-      const amendmentDigit = parseInt(amendment.permit_nbr.charAt(9));
+      const amendmentDigit = parseInt(amendment.permit_nbr.charAt(10)); // 10th character (0-indexed)
       const workDesc = amendment.work_desc || '';
       
       const hasChange = 
@@ -107,8 +105,8 @@ export async function GET(request: NextRequest) {
       totalInserted,
       contractorChanges,
       nextOffset,
-      nextUrl: nextOffset < 49281 ? `/api/cron/import-amendments?offset=${nextOffset}` : null,
-      progress: `${Math.round((nextOffset / 49281) * 100)}%`
+      nextUrl: nextOffset < 45146 ? `/api/cron/import-amendments?offset=${nextOffset}` : null,
+      progress: `${Math.round((nextOffset / 45146) * 100)}%`
     });
     
   } catch (error: any) {
