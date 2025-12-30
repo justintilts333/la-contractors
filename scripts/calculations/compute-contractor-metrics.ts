@@ -81,7 +81,15 @@ export async function computeContractorMetrics() {
     const totalBuilds = builds.length;
     const startedBuilds = builds.filter(b => b.started_date).length;
     const completedBuilds = builds.filter(b => b.finaled_date).length;
-    const activeBuilds = builds.filter(b => b.started_date && !b.finaled_date).length;
+    
+    // Filter out stale projects (started more than 18 months ago)
+    const eighteenMonthsAgo = new Date();
+    eighteenMonthsAgo.setMonth(eighteenMonthsAgo.getMonth() - 18);
+    const activeBuilds = builds.filter(b => 
+      b.started_date && 
+      !b.finaled_date && 
+      new Date(b.started_date) > eighteenMonthsAgo
+    ).length;
     
     const completionRate = startedBuilds > 0 
       ? Math.round((completedBuilds / startedBuilds) * 100)
