@@ -15,17 +15,20 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const { data: lastPermit } = await supabase
-      .from('permits')
-      .select('issue_date')
-      .order('issue_date', { ascending: false })
-      .limit(1)
+    // Get last sync time from watermarks table
+    const { data: watermark } = await supabase
+      .from('etl_watermarks')
+      .select('watermark_value, last_successful_run')
+      .eq('source_id', 'ladbs_permits_api')
       .single();
 
-    const lastDate = lastPermit?.issue_date || '2020-01-01';
+    // Use last successful run time, or 90 days ago if first run
+    const lastSync = watermark?.last_successful_run || 
+                     new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
     
+    // Search by refresh_time (catches new permits AND late-issued permits)
     const response = await fetch(
-      `${LADBS_API}?$where=issue_date > '${lastDate}' AND adu_changed >= '1'&$order=issue_date ASC&$limit=5000`
+      `${LADBS_API}?$where=refresh_time > '${lastSync}' AND adu_changed >= '1'&$order=refresh_time ASC&$limit=5000`
     );
 
     if (!response.ok) {
@@ -41,7 +44,6 @@ export async function GET(request: NextRequest) {
         ? 'JADU' 
         : 'ADU';
 
-      // Check if permit exists
       const { data: existing } = await supabase
         .from('permits')
         .select('permit_id')
@@ -61,7 +63,7 @@ export async function GET(request: NextRequest) {
       };
 
       if (existing) {
-        // Update existing permit (status/COO changes)
+        // Update existing permit (catches late-issued permits)
         await supabase
           .from('permits')
           .update(permitData)
@@ -76,7 +78,6 @@ export async function GET(request: NextRequest) {
           .single();
 
         if (newPermit) {
-          // Create corresponding build record
           await supabase.from('builds').insert({
             permit_id: newPermit.permit_id,
             address: permit.primary_address || null,
@@ -98,12 +99,23 @@ export async function GET(request: NextRequest) {
       }
     }
 
+    // Update watermark
+    await supabase
+      .from('etl_watermarks')
+      .upsert({
+        source_id: 'ladbs_permits_api',
+        watermark_type: 'TIMESTAMP',
+        watermark_value: new Date().toISOString(),
+        last_successful_run: new Date().toISOString(),
+        records_processed: permits.length
+      }, { onConflict: 'source_id' });
+
     return NextResponse.json({
       success: true,
       newPermits,
       updatedPermits,
       totalProcessed: permits.length,
-      lastDate
+      lastSync
     });
 
   } catch (error: any) {
