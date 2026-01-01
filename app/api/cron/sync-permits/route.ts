@@ -18,13 +18,13 @@ export async function GET(request: NextRequest) {
     // Get last sync time from watermarks table
     const { data: watermark } = await supabase
       .from('etl_watermarks')
-      .select('last_run')
+      .select('last_issued_date')
       .eq('source_key', 'ladbs_permits_api')
       .single();
 
-    // Use last run time, or 90 days ago if first run
-    const lastSyncDate = watermark?.last_run 
-      ? new Date(watermark.last_run)
+    // Use last issued date, or 90 days ago if first run
+    const lastSyncDate = watermark?.last_issued_date 
+      ? new Date(watermark.last_issued_date)
       : new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
     
     // Format as YYYY-MM-DD (API requires this format)
@@ -110,8 +110,8 @@ export async function GET(request: NextRequest) {
       .upsert({
         source: 'LADBS',
         source_key: 'ladbs_permits_api',
-        last_run: now.toISOString(),
-        records_processed: permits.length
+        last_issued_date: now.toISOString(),
+        updated_at: now.toISOString()
       }, { onConflict: 'source_key' });
 
     return NextResponse.json({
