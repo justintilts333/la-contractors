@@ -12,19 +12,37 @@ export async function GET(request: NextRequest) {
   try {
     const url = new URL(request.url);
     const offset = parseInt(url.searchParams.get('offset') || '0');
-    const limit = 10; // Process 10 base permits at a time
+    const limit = 10;
     
-    // Get BASE permits only (digit 0)
-    const { data: permits, error } = await supabase
+    // Get ALL permits, then filter base permits in JavaScript
+    const { data: allPermits, error } = await supabase
       .from('permits')
       .select('permit_id, permit_nbr')
-      .eq(supabase.raw('SUBSTRING(permit_nbr FROM 11 FOR 1)'), '0')
       .range(offset, offset + limit - 1);
     
     if (error) throw error;
     
-    if (!permits || permits.length === 0) {
+    if (!allPermits || allPermits.length === 0) {
       return NextResponse.json({ done: true, message: 'Complete!' });
+    }
+    
+    // Filter to only base permits (10th character = '0')
+    const permits = allPermits.filter(p => p.permit_nbr.charAt(10) === '0');
+    
+    if (permits.length === 0) {
+      // Skip this batch if no base permits
+      const nextOffset = offset + limit;
+      return NextResponse.json({
+        success: true,
+        offset,
+        processed: 0,
+        totalFetched: 0,
+        totalInserted: 0,
+        contractorChanges: 0,
+        nextOffset,
+        nextUrl: nextOffset < 49281 ? `/api/cron/import-amendments?offset=${nextOffset}` : null,
+        progress: `${Math.round((nextOffset / 49281) * 100)}%`
+      });
     }
     
     let totalFetched = 0;
@@ -59,7 +77,7 @@ export async function GET(request: NextRequest) {
       const permitInfo = permitMap.get(amendment.permit_nbr);
       if (!permitInfo) continue;
       
-      const amendmentDigit = parseInt(amendment.permit_nbr.charAt(10)); // 10th character (0-indexed)
+      const amendmentDigit = parseInt(amendment.permit_nbr.charAt(10));
       const workDesc = amendment.work_desc || '';
       
       const hasChange = 
@@ -105,8 +123,8 @@ export async function GET(request: NextRequest) {
       totalInserted,
       contractorChanges,
       nextOffset,
-      nextUrl: nextOffset < 45146 ? `/api/cron/import-amendments?offset=${nextOffset}` : null,
-      progress: `${Math.round((nextOffset / 45146) * 100)}%`
+      nextUrl: nextOffset < 49281 ? `/api/cron/import-amendments?offset=${nextOffset}` : null,
+      progress: `${Math.round((nextOffset / 49281) * 100)}%`
     });
     
   } catch (error: any) {
