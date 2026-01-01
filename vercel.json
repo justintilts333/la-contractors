@@ -1,6 +1,14 @@
 {
   "crons": [
     {
+      "path": "/api/cron/sync-permits",
+      "schedule": "0 2 * * *"
+    },
+    {
+      "path": "/api/cron/sync-coo",
+      "schedule": "0 3 * * *"
+    },
+    {
       "path": "/api/cron/calculations",
       "schedule": "0 4 * * *"
     },
