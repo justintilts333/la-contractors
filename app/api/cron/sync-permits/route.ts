@@ -18,17 +18,21 @@ export async function GET(request: NextRequest) {
     // Get last sync time from watermarks table
     const { data: watermark } = await supabase
       .from('etl_watermarks')
-      .select('watermark_value, last_successful_run')
-      .eq('source_id', 'ladbs_permits_api')
+      .select('last_run')
+      .eq('source_key', 'ladbs_permits_api')
       .single();
 
-    // Use last successful run time, or 90 days ago if first run
-    const lastSync = watermark?.last_successful_run || 
-                     new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
+    // Use last run time, or 90 days ago if first run
+    const lastSyncDate = watermark?.last_run 
+      ? new Date(watermark.last_run)
+      : new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+    
+    // Format as YYYY-MM-DD (API requires this format)
+    const lastSync = lastSyncDate.toISOString().split('T')[0];
     
     // Search by refresh_time (catches new permits AND late-issued permits)
     const response = await fetch(
-      `${LADBS_API}?$where=refresh_time > '${lastSync}' AND adu_changed >= '1'&$order=refresh_time ASC&$limit=5000`
+      `${LADBS_API}?$where=refresh_time>'${lastSync}' AND adu_changed >= '1'&$order=refresh_time ASC&$limit=5000`
     );
 
     if (!response.ok) {
@@ -100,15 +104,15 @@ export async function GET(request: NextRequest) {
     }
 
     // Update watermark
+    const now = new Date();
     await supabase
       .from('etl_watermarks')
       .upsert({
-        source_id: 'ladbs_permits_api',
-        watermark_type: 'TIMESTAMP',
-        watermark_value: new Date().toISOString(),
-        last_successful_run: new Date().toISOString(),
+        source: 'LADBS',
+        source_key: 'ladbs_permits_api',
+        last_run: now.toISOString(),
         records_processed: permits.length
-      }, { onConflict: 'source_id' });
+      }, { onConflict: 'source_key' });
 
     return NextResponse.json({
       success: true,
