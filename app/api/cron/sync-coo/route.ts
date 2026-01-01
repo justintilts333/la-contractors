@@ -15,119 +15,135 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    // Get base permits that need COO check (finaled status but no contractor)
+    // Get permits with status="Permit Finaled" but no contractor
     const { data: permits } = await supabase
       .from('permits')
-      .select(`
-        permit_id, 
-        permit_nbr, 
-        finaled_date,
-        builds!inner(build_id)
-      `)
+      .select('permit_id, permit_nbr')
       .eq('status', 'Permit Finaled')
+      .is('finaled_date', null)
       .limit(100);
 
     if (!permits || permits.length === 0) {
-      return NextResponse.json({ message: 'No permits to sync' });
+      return NextResponse.json({
+        success: true,
+        permitsChecked: 0,
+        permitsUpdated: 0,
+        contractorsLinked: 0
+      });
     }
 
-    let updated = 0;
+    let permitsUpdated = 0;
     let contractorsLinked = 0;
 
     for (const permit of permits) {
-      // Check if build already has contractor
-      const { data: existingContractor } = await supabase
+      // Check if this permit already has a contractor
+      const { data: existingLink } = await supabase
         .from('build_contractors')
         .select('contractor_id')
-        .eq('build_id', (permit.builds as any)[0].build_id)
+        .eq('build_id', (await supabase
+          .from('builds')
+          .select('build_id')
+          .eq('permit_id', permit.permit_id)
+          .single()
+        ).data?.build_id)
+        .limit(1)
         .single();
 
-      if (existingContractor) continue; // Skip if already has contractor
-
-      // Build list of permit numbers to check (base + amendments)
-      const permitNumbers = [permit.permit_nbr];
-      
-      // Add amendments (change 10th character from 0 to 1-9)
-      for (let i = 1; i <= 9; i++) {
-        const amendmentNbr = 
-          permit.permit_nbr.substring(0, 10) + 
-          i + 
-          permit.permit_nbr.substring(11);
-        permitNumbers.push(amendmentNbr);
+      if (existingLink) {
+        continue; // Skip - already has contractor
       }
 
+      // Try base permit + 9 amendments
       let cooFound = false;
+      let contractorId: string | null = null;
+      let finaledDate: string | null = null;
+      let foundOnAmendment = false;
 
-      // Check each permit number for COO
-      for (const permitNbr of permitNumbers) {
-        const response = await fetch(
-          `${COFO_API}?pcis_permit=${permitNbr}`
-        );
+      for (let i = 0; i <= 9; i++) {
+        const permitNbr = permit.permit_nbr.substring(0, 10) + i + permit.permit_nbr.substring(11);
+        const cooResponse = await fetch(`${COFO_API}?pcis_permit=${permitNbr}`);
+        
+        if (!cooResponse.ok) continue;
 
-        if (!response.ok) continue;
+        const cooData = await cooResponse.json();
+        if (!cooData || cooData.length === 0) continue;
 
-        const coos = await response.json();
-        if (coos.length === 0) continue;
-
-        const coo = coos[0];
+        const coo = cooData[0];
+        
+        // Found COO!
         cooFound = true;
+        foundOnAmendment = (i > 0);
+        finaledDate = coo.cofo_issue_date?.split('T')[0] || null;
 
-        // Update base permit with finaled_date
-        if (coo.cofo_issue_date && !permit.finaled_date) {
-          await supabase
-            .from('permits')
-            .update({
-              finaled_date: coo.cofo_issue_date.split('T')[0]
-            })
-            .eq('permit_id', permit.permit_id);
-          updated++;
-        }
+        // Update permit finaled_date
+        await supabase
+          .from('permits')
+          .update({ finaled_date: finaledDate })
+          .eq('permit_id', permit.permit_id);
 
-        // Link contractor
+        permitsUpdated++;
+
+        // Find or create contractor
         if (coo.license) {
-          const { data: contractor } = await supabase
+          const { data: existingContractor } = await supabase
             .from('contractors')
             .select('contractor_id')
             .eq('license_number', coo.license)
             .single();
 
-          let contractorId = contractor?.contractor_id;
-
-          if (!contractorId) {
+          if (existingContractor) {
+            contractorId = existingContractor.contractor_id;
+          } else {
             // Create new contractor
             const { data: newContractor } = await supabase
               .from('contractors')
               .insert({
-                contractor_name: coo.contractors_business_name,
+                contractor_name: coo.contractors_business_name || 'Unknown',
                 license_number: coo.license,
-                license_type: coo.license_type,
-                created_at: new Date()
+                license_type: coo.license_type || null,
+                created_at: new Date(),
+                updated_at: new Date()
               })
               .select('contractor_id')
               .single();
 
-            contractorId = newContractor?.contractor_id;
+            contractorId = newContractor?.contractor_id || null;
           }
 
+          // Link contractor to build
           if (contractorId) {
-            await supabase
-              .from('build_contractors')
-              .upsert({
-                build_id: (permit.builds as any)[0].build_id,
-                contractor_id: contractorId
-              }, { onConflict: 'build_id,contractor_id' });
-            contractorsLinked++;
+            const { data: build } = await supabase
+              .from('builds')
+              .select('build_id')
+              .eq('permit_id', permit.permit_id)
+              .single();
+
+            if (build) {
+              await supabase.from('build_contractors').insert({
+                build_id: build.build_id,
+                contractor_id: contractorId,
+                role: 'PRIMARY',
+                created_at: new Date()
+              });
+
+              contractorsLinked++;
+
+              // If found on amendment, copy to base permit too
+              if (foundOnAmendment) {
+                console.log(`Contractor found on amendment ${i} for ${permit.permit_nbr}, copied to base`);
+              }
+            }
           }
         }
 
-        break; // Found COO, stop checking amendments
+        break; // Stop checking after first COO found
       }
     }
 
     return NextResponse.json({
       success: true,
       permitsChecked: permits.length,
-      permitsUpdated: updated,
+      permitsUpdated,
       contractorsLinked
     });
 

@@ -5,6 +5,10 @@
       "schedule": "0 2 * * *"
     },
     {
+      "path": "/api/cron/sync-amendments",
+      "schedule": "30 2 * * *"
+    },
+    {
       "path": "/api/cron/sync-coo",
       "schedule": "0 3 * * *"
     },
