@@ -31,8 +31,9 @@ export async function GET(request: NextRequest) {
     const lastSync = lastSyncDate.toISOString().split('T')[0];
     
     // Search by refresh_time (catches new permits AND late-issued permits)
+    // Reduced to 500 to avoid timeout
     const response = await fetch(
-      `${LADBS_API}?$where=refresh_time>'${lastSync}' AND adu_changed >= '1'&$order=refresh_time ASC&$limit=5000`
+      `${LADBS_API}?$where=refresh_time>'${lastSync}' AND adu_changed >= '1'&$order=refresh_time ASC&$limit=500`
     );
 
     if (!response.ok) {
@@ -103,16 +104,18 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    // Update watermark
-    const now = new Date();
-    await supabase
-      .from('etl_watermarks')
-      .upsert({
-        source: 'LADBS',
-        source_key: 'ladbs_permits_api',
-        last_issued_date: now.toISOString(),
-        updated_at: now.toISOString()
-      }, { onConflict: 'source_key' });
+    // Update watermark to last processed permit (incremental progress)
+    if (permits.length > 0) {
+      const lastPermit = permits[permits.length - 1];
+      await supabase
+        .from('etl_watermarks')
+        .upsert({
+          source: 'LADBS',
+          source_key: 'ladbs_permits_api',
+          last_issued_date: lastPermit.refresh_time?.split('T')[0] || new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'source_key' });
+    }
 
     return NextResponse.json({
       success: true,
