@@ -104,15 +104,18 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    // Update watermark to last processed permit (incremental progress)
+    // Update watermark incrementally (move forward 1 day at a time)
     if (permits.length > 0) {
-      const lastPermit = permits[permits.length - 1];
+      const firstPermit = permits[0];
+      const currentDate = new Date(firstPermit.refresh_time);
+      currentDate.setDate(currentDate.getDate() + 1); // Move forward 1 day
+      
       await supabase
         .from('etl_watermarks')
         .upsert({
           source: 'LADBS',
           source_key: 'ladbs_permits_api',
-          last_issued_date: lastPermit.refresh_time?.split('T')[0] || new Date().toISOString(),
+          last_issued_date: currentDate.toISOString().split('T')[0],
           updated_at: new Date().toISOString()
         }, { onConflict: 'source_key' });
     }
